@@ -9,6 +9,7 @@ node_modules/
 # Derleme çıktıları
 dist/
 build/
+target/
 
 # Loglar ve işletim sistemi dosyaları
 *.log
