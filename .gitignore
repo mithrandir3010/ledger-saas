@@ -1,0 +1,15 @@
+# Ortam değişkenleri — asla commit etmeyin
+.env
+.env.local
+.env.*.local
+
+# Bağımlılıklar
+node_modules/
+
+# Derleme çıktıları
+dist/
+build/
+
+# Loglar ve işletim sistemi dosyaları
+*.log
+.DS_Store
