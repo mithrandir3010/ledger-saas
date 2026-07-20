@@ -20,12 +20,16 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.SQLDelete;
+import org.hibernate.annotations.SQLRestriction;
 import org.springframework.data.annotation.CreatedDate;
 import org.springframework.data.annotation.LastModifiedDate;
 import org.springframework.data.jpa.domain.support.AuditingEntityListener;
 
 @Entity
 @Table(name = "invoices")
+@SQLDelete(sql = "UPDATE invoices SET is_deleted = true WHERE id = ?")
+@SQLRestriction("is_deleted = false")
 @EntityListeners(AuditingEntityListener.class)
 @Getter
 @Setter
@@ -58,6 +62,10 @@ public class Invoice {
 
     @Column(name = "pdf_url", length = 512)
     private String pdfUrl;
+
+    @Builder.Default
+    @Column(name = "is_deleted", nullable = false)
+    private Boolean isDeleted = false;
 
     @CreatedDate
     @Column(name = "created_at", nullable = false, updatable = false)
