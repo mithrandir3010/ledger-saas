@@ -3,7 +3,6 @@ package com.ledgersaas.backend.scheduler;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -19,9 +18,11 @@ import com.ledgersaas.backend.model.event.PaymentFailureEvent;
 import com.ledgersaas.backend.model.event.PaymentSuccessEvent;
 import com.ledgersaas.backend.repository.InvoiceRepository;
 import com.ledgersaas.backend.repository.SubscriptionRepository;
+import com.ledgersaas.backend.service.PaymentGatewayService;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -29,7 +30,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Captor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
-import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.context.ApplicationEventPublisher;
 
@@ -45,7 +45,9 @@ class SubscriptionSchedulerTest {
     @Mock
     private ApplicationEventPublisher eventPublisher;
 
-    @Spy
+    @Mock
+    private PaymentGatewayService paymentGatewayService;
+
     @InjectMocks
     private SubscriptionScheduler scheduler;
 
@@ -80,19 +82,46 @@ class SubscriptionSchedulerTest {
                 .build();
     }
 
+    private Invoice buildFailedInvoice(Subscription subscription, LocalDateTime createdAt) {
+        Invoice invoice = Invoice.builder()
+                .id(99L)
+                .subscription(subscription)
+                .user(subscription.getUser())
+                .amount(subscription.getPlan().getPrice())
+                .status(InvoiceStatus.FAILED)
+                .billingDate(createdAt)
+                .build();
+        invoice.setCreatedAt(createdAt);
+        return invoice;
+    }
+
+    private void stubExpired(List<Subscription> subscriptions) {
+        when(subscriptionRepository.findAllByStatusAndCurrentPeriodEndBefore(
+                eq(SubscriptionStatus.ACTIVE), any(LocalDateTime.class)))
+                .thenReturn(subscriptions);
+    }
+
+    private void stubPastDue(List<Subscription> subscriptions) {
+        when(subscriptionRepository.findAllByStatus(SubscriptionStatus.PAST_DUE))
+                .thenReturn(subscriptions);
+    }
+
+    // -----------------------------------------------------------------
+    // Yenileme (renewal) senaryolari
+    // -----------------------------------------------------------------
+
     @Test
     @DisplayName("cancelAtPeriodEnd=true olan abonelik EXPIRED yapılmalı, fatura ve event üretilmemeli")
     void checkExpiredSubscriptions_whenCancelAtPeriodEnd_shouldExpireWithoutInvoice() {
         Subscription subscription =
                 buildSubscription(true, BillingInterval.MONTHLY, new BigDecimal("29.99"));
-        when(subscriptionRepository.findAllByStatusAndCurrentPeriodEndBefore(
-                eq(SubscriptionStatus.ACTIVE), any(LocalDateTime.class)))
-                .thenReturn(List.of(subscription));
+        stubExpired(List.of(subscription));
+        stubPastDue(List.of());
 
         scheduler.checkExpiredSubscriptions();
 
         assertThat(subscription.getStatus()).isEqualTo(SubscriptionStatus.EXPIRED);
-        verify(scheduler, never()).simulatePayment(any());
+        verify(paymentGatewayService, never()).chargeSubscription(any());
         verify(subscriptionRepository).saveAll(List.of(subscription));
         verify(invoiceRepository).saveAll(invoiceCaptor.capture());
         assertThat(invoiceCaptor.getValue()).isEmpty();
@@ -104,10 +133,9 @@ class SubscriptionSchedulerTest {
     void checkExpiredSubscriptions_whenPaymentSucceedsMonthly_shouldRenewOneMonthAndCreatePaidInvoice() {
         BigDecimal price = new BigDecimal("29.99");
         Subscription subscription = buildSubscription(false, BillingInterval.MONTHLY, price);
-        when(subscriptionRepository.findAllByStatusAndCurrentPeriodEndBefore(
-                eq(SubscriptionStatus.ACTIVE), any(LocalDateTime.class)))
-                .thenReturn(List.of(subscription));
-        doReturn(true).when(scheduler).simulatePayment(subscription);
+        stubExpired(List.of(subscription));
+        stubPastDue(List.of());
+        when(paymentGatewayService.chargeSubscription(subscription)).thenReturn(true);
 
         scheduler.checkExpiredSubscriptions();
 
@@ -138,10 +166,9 @@ class SubscriptionSchedulerTest {
     void checkExpiredSubscriptions_whenPaymentSucceedsYearly_shouldRenewOneYearAndCreatePaidInvoice() {
         Subscription subscription =
                 buildSubscription(false, BillingInterval.YEARLY, new BigDecimal("299.99"));
-        when(subscriptionRepository.findAllByStatusAndCurrentPeriodEndBefore(
-                eq(SubscriptionStatus.ACTIVE), any(LocalDateTime.class)))
-                .thenReturn(List.of(subscription));
-        doReturn(true).when(scheduler).simulatePayment(subscription);
+        stubExpired(List.of(subscription));
+        stubPastDue(List.of());
+        when(paymentGatewayService.chargeSubscription(subscription)).thenReturn(true);
 
         scheduler.checkExpiredSubscriptions();
 
@@ -165,10 +192,9 @@ class SubscriptionSchedulerTest {
         Subscription subscription =
                 buildSubscription(false, BillingInterval.MONTHLY, new BigDecimal("29.99"));
         subscription.setCurrentPeriodEnd(originalPeriodEnd);
-        when(subscriptionRepository.findAllByStatusAndCurrentPeriodEndBefore(
-                eq(SubscriptionStatus.ACTIVE), any(LocalDateTime.class)))
-                .thenReturn(List.of(subscription));
-        doReturn(false).when(scheduler).simulatePayment(subscription);
+        stubExpired(List.of(subscription));
+        stubPastDue(List.of());
+        when(paymentGatewayService.chargeSubscription(subscription)).thenReturn(false);
 
         scheduler.checkExpiredSubscriptions();
 
@@ -189,16 +215,89 @@ class SubscriptionSchedulerTest {
     }
 
     @Test
-    @DisplayName("Süresi dolan abonelik yoksa hiçbir kayıt işlemi ve event yayını yapılmamalı")
-    void checkExpiredSubscriptions_whenNoExpiredSubscriptions_shouldDoNothing() {
-        when(subscriptionRepository.findAllByStatusAndCurrentPeriodEndBefore(
-                eq(SubscriptionStatus.ACTIVE), any(LocalDateTime.class)))
-                .thenReturn(List.of());
+    @DisplayName("İşlenecek abonelik yoksa hiçbir kayıt işlemi ve event yayını yapılmamalı")
+    void checkExpiredSubscriptions_whenNoSubscriptions_shouldDoNothing() {
+        stubExpired(List.of());
+        stubPastDue(List.of());
 
         scheduler.checkExpiredSubscriptions();
 
         verify(subscriptionRepository, never()).saveAll(any());
         verify(invoiceRepository, never()).saveAll(any());
+        verify(eventPublisher, never()).publishEvent(any());
+    }
+
+    // -----------------------------------------------------------------
+    // Dunning senaryolari
+    // -----------------------------------------------------------------
+
+    @Test
+    @DisplayName("Dunning: son FAILED fatura 3 günden eski olan PAST_DUE abonelik EXPIRED yapılmalı")
+    void checkExpiredSubscriptions_whenPastDueOlderThanDunningWindow_shouldExpire() {
+        Subscription subscription =
+                buildSubscription(false, BillingInterval.MONTHLY, new BigDecimal("29.99"));
+        subscription.setStatus(SubscriptionStatus.PAST_DUE);
+        stubExpired(List.of());
+        stubPastDue(List.of(subscription));
+        when(invoiceRepository.findFirstBySubscriptionIdAndStatusOrderByCreatedAtDesc(
+                subscription.getId(), InvoiceStatus.FAILED))
+                .thenReturn(Optional.of(buildFailedInvoice(subscription, LocalDateTime.now().minusDays(4))));
+
+        scheduler.checkExpiredSubscriptions();
+
+        assertThat(subscription.getStatus()).isEqualTo(SubscriptionStatus.EXPIRED);
+        verify(paymentGatewayService, never()).chargeSubscription(any());
+        verify(subscriptionRepository).saveAll(List.of(subscription));
+        verify(invoiceRepository).saveAll(invoiceCaptor.capture());
+        assertThat(invoiceCaptor.getValue()).isEmpty();
+        verify(eventPublisher, never()).publishEvent(any());
+    }
+
+    @Test
+    @DisplayName("Dunning: pencere içindeki (1 gün) PAST_DUE abonelikte tahsilat başarılıysa abonelik yeniden ACTIVE olmalı")
+    void checkExpiredSubscriptions_whenDunningRetrySucceeds_shouldReactivateSubscription() {
+        BigDecimal price = new BigDecimal("29.99");
+        Subscription subscription = buildSubscription(false, BillingInterval.MONTHLY, price);
+        subscription.setStatus(SubscriptionStatus.PAST_DUE);
+        stubExpired(List.of());
+        stubPastDue(List.of(subscription));
+        when(invoiceRepository.findFirstBySubscriptionIdAndStatusOrderByCreatedAtDesc(
+                subscription.getId(), InvoiceStatus.FAILED))
+                .thenReturn(Optional.of(buildFailedInvoice(subscription, LocalDateTime.now().minusDays(1))));
+        when(paymentGatewayService.chargeSubscription(subscription)).thenReturn(true);
+
+        scheduler.checkExpiredSubscriptions();
+
+        assertThat(subscription.getStatus()).isEqualTo(SubscriptionStatus.ACTIVE);
+        assertThat(subscription.getCurrentPeriodEnd())
+                .isEqualTo(subscription.getCurrentPeriodStart().plusMonths(1));
+
+        verify(invoiceRepository).saveAll(invoiceCaptor.capture());
+        assertThat(invoiceCaptor.getValue())
+                .singleElement()
+                .extracting(Invoice::getStatus)
+                .isEqualTo(InvoiceStatus.PAID);
+        verify(eventPublisher).publishEvent(any(PaymentSuccessEvent.class));
+    }
+
+    @Test
+    @DisplayName("Dunning: bekleme gününde (2 gün, çift) tahsilat denenmemeli ve abonelik PAST_DUE kalmalı")
+    void checkExpiredSubscriptions_whenDunningWaitDay_shouldNotCharge() {
+        Subscription subscription =
+                buildSubscription(false, BillingInterval.MONTHLY, new BigDecimal("29.99"));
+        subscription.setStatus(SubscriptionStatus.PAST_DUE);
+        stubExpired(List.of());
+        stubPastDue(List.of(subscription));
+        when(invoiceRepository.findFirstBySubscriptionIdAndStatusOrderByCreatedAtDesc(
+                subscription.getId(), InvoiceStatus.FAILED))
+                .thenReturn(Optional.of(buildFailedInvoice(subscription, LocalDateTime.now().minusDays(2))));
+
+        scheduler.checkExpiredSubscriptions();
+
+        assertThat(subscription.getStatus()).isEqualTo(SubscriptionStatus.PAST_DUE);
+        verify(paymentGatewayService, never()).chargeSubscription(any());
+        verify(invoiceRepository).saveAll(invoiceCaptor.capture());
+        assertThat(invoiceCaptor.getValue()).isEmpty();
         verify(eventPublisher, never()).publishEvent(any());
     }
 }
