@@ -76,8 +76,9 @@ public class SubscriptionScheduler {
 
     /**
      * Harici ödeme geçidini simüle eder; %90 ihtimalle başarılı döner.
+     * Birim testlerde deterministik stub'lanabilmesi için package-private.
      */
-    private boolean simulatePayment(Subscription subscription) {
+    boolean simulatePayment(Subscription subscription) {
         return ThreadLocalRandom.current().nextInt(100) < 90;
     }
 

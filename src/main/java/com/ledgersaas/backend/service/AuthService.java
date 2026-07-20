@@ -3,6 +3,7 @@ package com.ledgersaas.backend.service;
 import com.ledgersaas.backend.dto.AuthResponse;
 import com.ledgersaas.backend.dto.LoginRequest;
 import com.ledgersaas.backend.dto.RegisterRequest;
+import com.ledgersaas.backend.exception.UserAlreadyExistsException;
 import com.ledgersaas.backend.model.entity.User;
 import com.ledgersaas.backend.model.enums.SubscriptionStatus;
 import com.ledgersaas.backend.repository.SubscriptionRepository;
@@ -34,7 +35,7 @@ public class AuthService {
     @Transactional
     public AuthResponse register(RegisterRequest request) {
         if (userRepository.existsByEmail(request.email())) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Bu e-posta adresi zaten kayıtlı");
+            throw new UserAlreadyExistsException(request.email());
         }
 
         User user = User.builder()
