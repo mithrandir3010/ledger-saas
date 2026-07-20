@@ -15,6 +15,8 @@ import com.ledgersaas.backend.model.entity.User;
 import com.ledgersaas.backend.model.enums.BillingInterval;
 import com.ledgersaas.backend.model.enums.InvoiceStatus;
 import com.ledgersaas.backend.model.enums.SubscriptionStatus;
+import com.ledgersaas.backend.model.event.PaymentFailureEvent;
+import com.ledgersaas.backend.model.event.PaymentSuccessEvent;
 import com.ledgersaas.backend.repository.InvoiceRepository;
 import com.ledgersaas.backend.repository.SubscriptionRepository;
 import java.math.BigDecimal;
@@ -29,6 +31,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.context.ApplicationEventPublisher;
 
 @ExtendWith(MockitoExtension.class)
 class SubscriptionSchedulerTest {
@@ -39,12 +42,18 @@ class SubscriptionSchedulerTest {
     @Mock
     private InvoiceRepository invoiceRepository;
 
+    @Mock
+    private ApplicationEventPublisher eventPublisher;
+
     @Spy
     @InjectMocks
     private SubscriptionScheduler scheduler;
 
     @Captor
     private ArgumentCaptor<List<Invoice>> invoiceCaptor;
+
+    @Captor
+    private ArgumentCaptor<Object> eventCaptor;
 
     private Subscription buildSubscription(boolean cancelAtPeriodEnd, BillingInterval interval, BigDecimal price) {
         User user = User.builder()
@@ -72,7 +81,7 @@ class SubscriptionSchedulerTest {
     }
 
     @Test
-    @DisplayName("cancelAtPeriodEnd=true olan abonelik EXPIRED yapılmalı, fatura kesilmemeli")
+    @DisplayName("cancelAtPeriodEnd=true olan abonelik EXPIRED yapılmalı, fatura ve event üretilmemeli")
     void checkExpiredSubscriptions_whenCancelAtPeriodEnd_shouldExpireWithoutInvoice() {
         Subscription subscription =
                 buildSubscription(true, BillingInterval.MONTHLY, new BigDecimal("29.99"));
@@ -87,10 +96,11 @@ class SubscriptionSchedulerTest {
         verify(subscriptionRepository).saveAll(List.of(subscription));
         verify(invoiceRepository).saveAll(invoiceCaptor.capture());
         assertThat(invoiceCaptor.getValue()).isEmpty();
+        verify(eventPublisher, never()).publishEvent(any());
     }
 
     @Test
-    @DisplayName("Ödeme başarılı + MONTHLY plan: dönem 1 ay uzatılmalı, PAID fatura kesilmeli")
+    @DisplayName("Ödeme başarılı + MONTHLY plan: dönem 1 ay uzatılmalı, PAID fatura ve PaymentSuccessEvent üretilmeli")
     void checkExpiredSubscriptions_whenPaymentSucceedsMonthly_shouldRenewOneMonthAndCreatePaidInvoice() {
         BigDecimal price = new BigDecimal("29.99");
         Subscription subscription = buildSubscription(false, BillingInterval.MONTHLY, price);
@@ -115,6 +125,12 @@ class SubscriptionSchedulerTest {
         assertThat(invoice.getSubscription()).isSameAs(subscription);
         assertThat(invoice.getUser()).isSameAs(subscription.getUser());
         assertThat(invoice.getBillingDate()).isEqualTo(subscription.getCurrentPeriodStart());
+
+        verify(eventPublisher).publishEvent(eventCaptor.capture());
+        assertThat(eventCaptor.getValue()).isInstanceOf(PaymentSuccessEvent.class);
+        PaymentSuccessEvent event = (PaymentSuccessEvent) eventCaptor.getValue();
+        assertThat(event.subscription()).isSameAs(subscription);
+        assertThat(event.invoice()).isSameAs(invoice);
     }
 
     @Test
@@ -138,10 +154,12 @@ class SubscriptionSchedulerTest {
                 .singleElement()
                 .extracting(Invoice::getStatus)
                 .isEqualTo(InvoiceStatus.PAID);
+
+        verify(eventPublisher).publishEvent(any(PaymentSuccessEvent.class));
     }
 
     @Test
-    @DisplayName("Ödeme başarısız: abonelik PAST_DUE olmalı, FAILED fatura kesilmeli")
+    @DisplayName("Ödeme başarısız: abonelik PAST_DUE olmalı, FAILED fatura ve PaymentFailureEvent üretilmeli")
     void checkExpiredSubscriptions_whenPaymentFails_shouldMarkPastDueAndCreateFailedInvoice() {
         LocalDateTime originalPeriodEnd = LocalDateTime.now().minusDays(1);
         Subscription subscription =
@@ -162,10 +180,16 @@ class SubscriptionSchedulerTest {
                 .singleElement()
                 .extracting(Invoice::getStatus)
                 .isEqualTo(InvoiceStatus.FAILED);
+
+        verify(eventPublisher).publishEvent(eventCaptor.capture());
+        assertThat(eventCaptor.getValue()).isInstanceOf(PaymentFailureEvent.class);
+        PaymentFailureEvent event = (PaymentFailureEvent) eventCaptor.getValue();
+        assertThat(event.subscription()).isSameAs(subscription);
+        assertThat(event.failureReason()).isNotBlank();
     }
 
     @Test
-    @DisplayName("Süresi dolan abonelik yoksa hiçbir kayıt işlemi yapılmamalı")
+    @DisplayName("Süresi dolan abonelik yoksa hiçbir kayıt işlemi ve event yayını yapılmamalı")
     void checkExpiredSubscriptions_whenNoExpiredSubscriptions_shouldDoNothing() {
         when(subscriptionRepository.findAllByStatusAndCurrentPeriodEndBefore(
                 eq(SubscriptionStatus.ACTIVE), any(LocalDateTime.class)))
@@ -175,5 +199,6 @@ class SubscriptionSchedulerTest {
 
         verify(subscriptionRepository, never()).saveAll(any());
         verify(invoiceRepository, never()).saveAll(any());
+        verify(eventPublisher, never()).publishEvent(any());
     }
 }

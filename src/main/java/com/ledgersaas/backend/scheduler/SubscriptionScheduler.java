@@ -5,6 +5,8 @@ import com.ledgersaas.backend.model.entity.Subscription;
 import com.ledgersaas.backend.model.enums.BillingInterval;
 import com.ledgersaas.backend.model.enums.InvoiceStatus;
 import com.ledgersaas.backend.model.enums.SubscriptionStatus;
+import com.ledgersaas.backend.model.event.PaymentFailureEvent;
+import com.ledgersaas.backend.model.event.PaymentSuccessEvent;
 import com.ledgersaas.backend.repository.InvoiceRepository;
 import com.ledgersaas.backend.repository.SubscriptionRepository;
 import java.time.LocalDateTime;
@@ -14,6 +16,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -23,8 +26,11 @@ import org.springframework.transaction.annotation.Transactional;
 @Slf4j
 public class SubscriptionScheduler {
 
+    private static final String PAYMENT_FAILURE_REASON = "Ödeme sağlayıcı işlemi reddetti (simülasyon)";
+
     private final SubscriptionRepository subscriptionRepository;
     private final InvoiceRepository invoiceRepository;
+    private final ApplicationEventPublisher eventPublisher;
 
     @Scheduled(cron = "0 0 0 * * ?")
     @SchedulerLock(
@@ -45,6 +51,7 @@ public class SubscriptionScheduler {
         log.info("Süresi dolan {} abonelik bulundu, işleniyor...", expiredSubscriptions.size());
 
         List<Invoice> newInvoices = new ArrayList<>();
+        List<Object> pendingEvents = new ArrayList<>();
 
         for (Subscription subscription : expiredSubscriptions) {
             if (Boolean.TRUE.equals(subscription.getCancelAtPeriodEnd())) {
@@ -57,21 +64,29 @@ public class SubscriptionScheduler {
                 subscription.setCurrentPeriodStart(now);
                 subscription.setCurrentPeriodEnd(calculateNextPeriodEnd(now, subscription));
                 subscription.setStatus(SubscriptionStatus.ACTIVE);
-                newInvoices.add(buildInvoice(subscription, InvoiceStatus.PAID, now));
-                log.info("Abonelik yenilendi, PAID faturası kesildi. id={}, yeni dönem sonu={}",
-                        subscription.getId(), subscription.getCurrentPeriodEnd());
+                Invoice invoice = buildInvoice(subscription, InvoiceStatus.PAID, now);
+                newInvoices.add(invoice);
+                pendingEvents.add(new PaymentSuccessEvent(subscription, invoice));
+                // user.getEmail() erisimi LAZY proxy'yi transaction icindeyken
+                // initialize eder; asenkron listener bu sayede guvenle okuyabilir.
+                log.info("Abonelik yenilendi, PAID faturası kesildi. id={}, userEmail={}, yeni dönem sonu={}",
+                        subscription.getId(), subscription.getUser().getEmail(), subscription.getCurrentPeriodEnd());
             } else {
                 subscription.setStatus(SubscriptionStatus.PAST_DUE);
-                newInvoices.add(buildInvoice(subscription, InvoiceStatus.FAILED, now));
+                Invoice invoice = buildInvoice(subscription, InvoiceStatus.FAILED, now);
+                newInvoices.add(invoice);
+                pendingEvents.add(new PaymentFailureEvent(subscription, invoice, PAYMENT_FAILURE_REASON));
                 log.warn("Ödeme başarısız; abonelik PAST_DUE durumuna alındı, FAILED faturası oluşturuldu. "
-                        + "Kullanıcıya bilgilendirme maili gönderilecek. subscriptionId={}", subscription.getId());
+                        + "subscriptionId={}, userEmail={}", subscription.getId(), subscription.getUser().getEmail());
             }
         }
 
         subscriptionRepository.saveAll(expiredSubscriptions);
         invoiceRepository.saveAll(newInvoices);
-        log.info("Abonelik kontrolü tamamlandı. Güncellenen abonelik: {}, kesilen fatura: {}",
-                expiredSubscriptions.size(), newInvoices.size());
+        pendingEvents.forEach(eventPublisher::publishEvent);
+
+        log.info("Abonelik kontrolü tamamlandı. Güncellenen abonelik: {}, kesilen fatura: {}, yayınlanan event: {}",
+                expiredSubscriptions.size(), newInvoices.size(), pendingEvents.size());
     }
 
     /**
